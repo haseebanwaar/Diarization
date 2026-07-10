@@ -7,6 +7,7 @@ frontend can render partial and final text directly.
 
 from __future__ import annotations
 
+import numpy as np
 import base64
 import json
 from typing import Any, cast
