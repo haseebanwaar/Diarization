@@ -58,7 +58,7 @@ class Pipeline:
         max_sentence_sec: float = 10.0,
         partial_emit_sec: float = 0.8,
         min_segment_sec: float = 0.6,
-        min_partial_samples: int | None = None,
+        # min_partial_samples: int | None = None,
     ):
         self.vad = vad or VADWrapper(threshold=vad_threshold)
         self.asr = asr_fn or nemo_transcribe
@@ -70,11 +70,6 @@ class Pipeline:
         self.max_sentence_samples = int(max_sentence_sec * SAMPLE_RATE)
         self.partial_emit_samples = max(1, int(partial_emit_sec * SAMPLE_RATE))
         self.min_segment_samples = int(min_segment_sec * SAMPLE_RATE)
-        self.min_partial_samples = (
-            int(min_partial_samples)
-            if min_partial_samples is not None
-            else max(self.min_segment_samples, self.partial_emit_samples)
-        )
 
         self._pending_audio = np.empty((0,), dtype=np.float32)
         self._stream_samples = 0
@@ -188,33 +183,13 @@ class Pipeline:
             return
 
         segment = self._current_audio()
-        if len(segment) < self.min_partial_samples and not force:
+        if len(segment) < self.min_segment_samples and not force:
             return
 
         if not force and (self._stream_samples - self._last_partial_emit_sample) < self.partial_emit_samples:
             return
 
-        try:
-            text = (self.asr(segment) or "").strip()
-        except Exception as exc:
-            yield self._build_event(
-                event_type="partial",
-                text="",
-                full_text="",
-                speaker=self._last_final_speaker,
-                # diarization={
-                #     "status": "error",
-                #     "speaker": self._last_final_speaker,
-                #     "segments": [],
-                # },
-                start_sample=self._segment_start_sample,
-                end_sample=self._last_voice_sample,
-                reason=f"asr_partial_error:{type(exc).__name__}",
-                sentence_index=0,
-                final=False,
-            )
-            return
-
+        text = (self.asr(segment) or "").strip()
         if not text:
             return
 
@@ -265,27 +240,7 @@ class Pipeline:
         if len(segment) < self.min_segment_samples:
             return
 
-        try:
-            full_text = (self.asr(segment) or "").strip()
-        except Exception as exc:
-            yield self._build_event(
-                event_type="final",
-                text="",
-                full_text="",
-                speaker=self._last_final_speaker,
-                # diarization={
-                #     "status": "error",
-                #     "speaker": self._last_final_speaker,
-                #     "segments": [],
-                # },
-                start_sample=start_sample,
-                end_sample=end_sample,
-                reason=f"asr_final_error:{type(exc).__name__}",
-                sentence_index=0,
-                final=True,
-            )
-            return
-
+        full_text = (self.asr(segment) or "").strip()
         if not full_text:
             return
 
