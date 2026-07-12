@@ -183,6 +183,9 @@ class Pipeline:
             return
 
         segment = self._current_audio()
+        if segment.size == 0:
+            return
+
         if len(segment) < self.min_segment_samples and not force:
             return
 
@@ -228,6 +231,9 @@ class Pipeline:
             return
 
         segment = self._current_audio()
+        if segment.size == 0:
+            return
+
         start_sample = self._segment_start_sample
         end_sample = max(self._last_voice_sample, start_sample + len(segment))
 
