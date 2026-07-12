@@ -39,7 +39,7 @@ DEFAULT_PIPELINE_CONFIG = {
     "silence_gap_sec": 0.6,
     "max_words": 24,
     "max_sentence_sec": 10.0,
-    "partial_emit_sec": 0.2,
+    "partial_emit_sec": 0.5,  # Increased: Too short of a duration can crash NeMo RNNT decoders
 }
 
 
@@ -111,6 +111,7 @@ async def ws_stream(websocket: WebSocket):
             raw = None
             if message.get("bytes") is not None:
                 raw = message["bytes"]
+
             elif message.get("text"):
                 text = message["text"].strip()
                 if text.lower() == "ping":
@@ -122,7 +123,7 @@ async def ws_stream(websocket: WebSocket):
                     payload = text
                 raw = _decode_audio_payload(payload)
 
-            if raw is None:
+            if not raw:  # Ignore None and empty bytes (b"") to prevent zero-length audio processing
                 continue
 
             for event in local_pipe.feed(raw):
