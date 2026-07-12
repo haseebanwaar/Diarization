@@ -5,6 +5,7 @@ import logging
 import nemo.collections.asr as nemo_asr
 
 _ASR_MODEL = None
+_ASR_DISABLED = False
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +21,10 @@ def _get_asr_model():
 
 def nemo_transcribe(data):
     """Transcribe float32 audio array @ 16kHz, return text string."""
+    global _ASR_DISABLED
 
     # 3200 samples @ 16kHz = 0.2 seconds.
-    if data is None or len(data) < 3200:
+    if _ASR_DISABLED or data is None or len(data) < 3200:
         return ""
 
     try:
@@ -34,6 +36,11 @@ def nemo_transcribe(data):
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         logger.exception("ASR transcription failed; disabling ASR for this process. %s", message)
+
+        # CUDA illegal access often poisons the process; stop retrying ASR.
+        if "cuda" in message.lower() or "illegal memory access" in message.lower():
+            _ASR_DISABLED = True
+
         return ""
 
 
