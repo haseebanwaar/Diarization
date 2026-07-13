@@ -19,8 +19,8 @@ from typing import Iterator
 import numpy as np
 
 from buffer import AudioBuffer
-# from nemo_dia import nemo_dia
-from parakeet import nemo_transcribe
+from nemo_dia import nemo_dia
+from parakeet import nemo_transcribe, nemo_transcribe_with_timestamps
 from vad import VADWrapper
 
 SAMPLE_RATE = 16000
@@ -51,18 +51,20 @@ class Pipeline:
         self,
         vad: VADWrapper | None = None,
         asr_fn=None,
-        # dia_fn=None,
+        dia_fn=None,
         vad_threshold: float = 0.5,
         silence_gap_sec: float = 0.6,
         max_words: int = 24,
         max_sentence_sec: float = 10.0,
         partial_emit_sec: float = 0.8,
         min_segment_sec: float = 0.6,
-        min_partial_samples: int | None = None,
+        pre_speech_pad_sec: float = 0.3,
+        use_diarization_context: bool = True,
+        # min_partial_samples: int | None = None,
     ):
         self.vad = vad or VADWrapper(threshold=vad_threshold)
         self.asr = asr_fn or nemo_transcribe
-        # self.dia = dia_fn or nemo_dia
+        self.dia = dia_fn or nemo_dia
 
         self.vad_threshold = vad_threshold
         self.silence_gap_samples = int(silence_gap_sec * SAMPLE_RATE)
@@ -70,11 +72,8 @@ class Pipeline:
         self.max_sentence_samples = int(max_sentence_sec * SAMPLE_RATE)
         self.partial_emit_samples = max(1, int(partial_emit_sec * SAMPLE_RATE))
         self.min_segment_samples = int(min_segment_sec * SAMPLE_RATE)
-        self.min_partial_samples = (
-            int(min_partial_samples)
-            if min_partial_samples is not None
-            else max(self.min_segment_samples, self.partial_emit_samples)
-        )
+        self.pre_speech_pad_samples = int(pre_speech_pad_sec * SAMPLE_RATE)
+        self.use_diarization_context = use_diarization_context
 
         self._pending_audio = np.empty((0,), dtype=np.float32)
         self._stream_samples = 0
@@ -83,11 +82,17 @@ class Pipeline:
         self._segment_start_sample = 0
         self._last_voice_sample = 0
         self._current_chunks: list[np.ndarray] = []
+        self._pre_speech_buffer: list[np.ndarray] = []
+        self._pre_speech_samples = 0
         self._segment_index = 0
         self._event_index = 0
         self._last_partial_text = ""
         self._last_partial_emit_sample = 0
         self._last_final_speaker = "unknown"
+        
+        # Context buffer for diarization: stores previous segments for context
+        self._context_history: list[dict] = []  # List of {audio, speaker, text}
+        self._max_context_segments = 2  # Keep last 2 segments for context
 
     # ------------------------------------------------------------------
     # public API
@@ -145,9 +150,20 @@ class Pipeline:
                 yield from self._finalize_segment(reason="max_duration")
 
         elif self._speaking:
+            # CRITICAL FIX: Append the frame to preserve intra-segment pauses!
+            # Dropping these frames strips natural pauses, corrupting ASR/Diarization.
+            yield from self._append_audio(frame)
+
             self._silence_samples += len(frame)
             if self._silence_samples >= self.silence_gap_samples:
                 yield from self._finalize_segment(reason="vad_silence")
+        else:
+            # Maintain a rolling pre-speech buffer to prevent clipping the first phoneme
+            self._pre_speech_buffer.append(frame.astype(np.float32, copy=True))
+            self._pre_speech_samples += len(frame)
+            while self._pre_speech_samples > self.pre_speech_pad_samples and len(self._pre_speech_buffer) > 1:
+                removed = self._pre_speech_buffer.pop(0)
+                self._pre_speech_samples -= len(removed)
 
         self._stream_samples += len(frame)
 
@@ -155,9 +171,11 @@ class Pipeline:
         self._segment_index += 1
         self._speaking = True
         self._silence_samples = 0
-        self._segment_start_sample = start_sample
+        self._segment_start_sample = max(0, start_sample - self._pre_speech_samples)
         self._last_voice_sample = start_sample
-        self._current_chunks = []
+        self._current_chunks = list(self._pre_speech_buffer)
+        self._pre_speech_buffer = []
+        self._pre_speech_samples = 0
         self._last_partial_text = ""
         self._last_partial_emit_sample = start_sample
 
@@ -188,33 +206,13 @@ class Pipeline:
             return
 
         segment = self._current_audio()
-        if len(segment) < self.min_partial_samples and not force:
+        if len(segment) < self.min_segment_samples and not force:
             return
 
         if not force and (self._stream_samples - self._last_partial_emit_sample) < self.partial_emit_samples:
             return
 
-        try:
-            text = (self.asr(segment) or "").strip()
-        except Exception as exc:
-            yield self._build_event(
-                event_type="partial",
-                text="",
-                full_text="",
-                speaker=self._last_final_speaker,
-                # diarization={
-                #     "status": "error",
-                #     "speaker": self._last_final_speaker,
-                #     "segments": [],
-                # },
-                start_sample=self._segment_start_sample,
-                end_sample=self._last_voice_sample,
-                reason=f"asr_partial_error:{type(exc).__name__}",
-                sentence_index=0,
-                final=False,
-            )
-            return
-
+        text = (self.asr(segment) or "").strip()
         if not text:
             return
 
@@ -230,17 +228,26 @@ class Pipeline:
 
         self._last_partial_text = text
         self._last_partial_emit_sample = self._stream_samples
+        
+        # For partials, use current speaker or fall back to last known speaker
         speaker = self._last_final_speaker
+        
+        # Optionally predict speaker based on context
+        if self.use_diarization_context and self._context_history:
+            # Predict speaker by keeping consistency with previous speaker
+            prev_speaker = self._context_history[-1]["speaker"]
+            speaker = prev_speaker
+        
         yield self._build_event(
             event_type="partial",
             text=text,
             full_text=text,
             speaker=speaker,
-            # diarization={
-            #     "status": "pending",
-            #     "speaker": speaker,
-            #     "segments": [],
-            # },
+            diarization={
+                "status": "pending",
+                "speaker": speaker,
+                "segments": [],
+            },
             start_sample=self._segment_start_sample,
             end_sample=self._last_voice_sample,
             reason="streaming",
@@ -265,38 +272,56 @@ class Pipeline:
         if len(segment) < self.min_segment_samples:
             return
 
-        try:
-            full_text = (self.asr(segment) or "").strip()
-        except Exception as exc:
-            yield self._build_event(
-                event_type="final",
-                text="",
-                full_text="",
-                speaker=self._last_final_speaker,
-                # diarization={
-                #     "status": "error",
-                #     "speaker": self._last_final_speaker,
-                #     "segments": [],
-                # },
-                start_sample=start_sample,
-                end_sample=end_sample,
-                reason=f"asr_final_error:{type(exc).__name__}",
-                sentence_index=0,
-                final=True,
-            )
-            return
-
+        full_text = (self.asr(segment) or "").strip()
         if not full_text:
             return
 
-        # raw_segments = self.dia(segment) or []
-        # timeline = self._parse_diarization(raw_segments, segment)
-        # primary_speaker = self._dominant_speaker(timeline)
-        primary_speaker = "unknown"
-        # if primary_speaker == "unknown":
-        #     primary_speaker = self._last_final_speaker
-        # else:
-        #     self._last_final_speaker = primary_speaker
+        # Build context for diarization
+        context = None
+        if self.use_diarization_context and self._context_history:
+            context = {}
+            # Pass the most recent segment as previous context
+            if self._context_history:
+                prev_seg = self._context_history[-1]
+                context["previous"] = {
+                    "audio": prev_seg["audio"],
+                    "speaker": prev_seg["speaker"],
+                }
+        
+        raw_segments = self.dia(segment, context=context) if context else self.dia(segment)
+        timeline = self._parse_diarization(raw_segments, segment)
+        primary_speaker = self._dominant_speaker(timeline)
+        if primary_speaker == "unknown":
+            primary_speaker = self._last_final_speaker
+        else:
+            self._last_final_speaker = primary_speaker
+
+        # Store this segment in context history for next segment's diarization
+        self._context_history.append({
+            "audio": segment.copy(),
+            "speaker": primary_speaker,
+            "text": full_text,
+        })
+        # Keep only the last N segments
+        if len(self._context_history) > self._max_context_segments:
+            self._context_history.pop(0)
+
+        # Get word-level timestamps
+        word_timestamps = nemo_transcribe_with_timestamps(segment) or []
+        
+        # Build word-level speaker assignments
+        words_with_speakers = []
+        for word_data in word_timestamps:
+            word = word_data.get("word", "")
+            word_start = word_data.get("start", 0.0)
+            word_end = word_data.get("end", 0.0)
+            speaker = self._get_speaker_for_word(word_start, word_end, timeline)
+            words_with_speakers.append({
+                "word": word,
+                "start": round(word_start, 3),
+                "end": round(word_end, 3),
+                "speaker": speaker,
+            })
 
         delivery_chunks = self._split_for_delivery(full_text, self.max_words)
         if not delivery_chunks:
@@ -308,18 +333,19 @@ class Pipeline:
                 text=chunk_text,
                 full_text=full_text,
                 speaker=primary_speaker,
-                # diarization={
-                #     "status": "final",
-                #     "speaker": primary_speaker,
-                #     "segments": [
-                #         {
-                #             "start": round(start, 3),
-                #             "end": round(end, 3),
-                #             "speaker": speaker,
-                #         }
-                #         for start, end, speaker in timeline
-                #     ],
-                # },
+                diarization={
+                    "status": "final",
+                    "speaker": primary_speaker,
+                    "segments": [
+                        {
+                            "start": round(start, 3),
+                            "end": round(end, 3),
+                            "speaker": speaker,
+                        }
+                        for start, end, speaker in timeline
+                    ],
+                },
+                words=words_with_speakers,
                 start_sample=start_sample,
                 end_sample=end_sample,
                 reason=reason,
@@ -338,12 +364,13 @@ class Pipeline:
         text: str,
         full_text: str,
         speaker: str,
-        # diarization: dict,
+        diarization: dict,
         start_sample: int,
         end_sample: int,
         reason: str,
         sentence_index: int,
         final: bool,
+        words: list = None,
     ) -> dict:
         self._event_index += 1
         start_sec = start_sample / SAMPLE_RATE
@@ -366,8 +393,9 @@ class Pipeline:
                 "text": text,
                 "full_text": full_text,
                 "word_count": _word_count(full_text),
+                "words": words or [],
             },
-            # "diarization": diarization,
+            "diarization": diarization,
             "debug": {
                 "stream_samples": self._stream_samples,
                 "speaking": self._speaking,
@@ -397,33 +425,85 @@ class Pipeline:
 
         return chunks
 
-    # @staticmethod
-    # def _parse_diarization(
-    #     raw_segments: list[str],
-    #     seg: np.ndarray,
-    # ) -> list[tuple[float, float, str]]:
-    #     timeline: list[tuple[float, float, str]] = []
-    #     duration = len(seg) / SAMPLE_RATE
-    #
-    #     for line in raw_segments:
-    #         parts = str(line).strip().split()
-    #         if len(parts) < 3:
-    #             continue
-    #         try:
-    #             start, end = float(parts[0]), float(parts[1])
-    #         except ValueError:
-    #             continue
-    #         speaker = " ".join(parts[2:])
-    #         start = max(0.0, start)
-    #         end = min(duration, end)
-    #         if end > start:
-    #             timeline.append((start, end, speaker))
-    #
-    #     timeline.sort(key=lambda item: (item[0], item[1]))
-    #     return timeline
-    #
-    # @staticmethod
-    # def _dominant_speaker(timeline: list[tuple[float, float, str]]) -> str:
-    #     if not timeline:
-    #         return "unknown"
-    #     return max(timeline, key=lambda item: item[1] - item[0])[2]
+    @staticmethod
+    def _parse_diarization(
+        raw_segments: list[str],
+        seg: np.ndarray,
+    ) -> list[tuple[float, float, str]]:
+        timeline: list[tuple[float, float, str]] = []
+        duration = len(seg) / SAMPLE_RATE
+
+        for line in raw_segments:
+            parts = str(line).strip().split()
+            if len(parts) < 3:
+                continue
+            try:
+                start, end = float(parts[0]), float(parts[1])
+            except ValueError:
+                continue
+            speaker = " ".join(parts[2:]).strip()
+            # Ensure speaker ID is non-empty
+            if not speaker:
+                speaker = "unknown"
+            start = max(0.0, start)
+            end = min(duration, end)
+            if end > start:
+                timeline.append((start, end, speaker))
+
+        timeline.sort(key=lambda item: (item[0], item[1]))
+        return timeline
+
+    @staticmethod
+    def _dominant_speaker(timeline: list[tuple[float, float, str]]) -> str:
+        """Find the speaker with the longest speaking duration."""
+        if not timeline:
+            return "unknown"
+        
+        speaker_durations = {}
+        for start, end, speaker in timeline:
+            duration = end - start
+            speaker = speaker.strip()
+            if speaker:
+                speaker_durations[speaker] = speaker_durations.get(speaker, 0) + duration
+        
+        if not speaker_durations:
+            return "unknown"
+        
+        return max(speaker_durations.items(), key=lambda x: x[1])[0]
+
+    @staticmethod
+    def _get_speaker_for_word(word_start: float, word_end: float, timeline: list[tuple[float, float, str]]) -> str:
+        """Find the speaker(s) that cover this word timestamp."""
+        if not timeline:
+            return "unknown"
+        
+        speakers = []
+        for seg_start, seg_end, speaker in timeline:
+            # Check if there's overlap between word and speaker segment
+            overlap_start = max(word_start, seg_start)
+            overlap_end = min(word_end, seg_end)
+            if overlap_end > overlap_start:
+                overlap_duration = overlap_end - overlap_start
+                speakers.append((overlap_duration, speaker))
+        
+        if speakers:
+            # Return the speaker with the most overlap
+            return max(speakers, key=lambda x: x[0])[1]
+        
+        # Fallback: find the closest speaker segment by distance
+        closest_speaker = None
+        min_distance = float('inf')
+        for seg_start, seg_end, speaker in timeline:
+            # Distance from word to segment
+            if word_end < seg_start:
+                distance = seg_start - word_end
+            elif word_start > seg_end:
+                distance = word_start - seg_end
+            else:
+                distance = 0
+            
+            if distance < min_distance:
+                min_distance = distance
+                closest_speaker = speaker
+        
+        return closest_speaker if closest_speaker else "unknown"
