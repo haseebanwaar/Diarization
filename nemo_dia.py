@@ -3,23 +3,96 @@ from nemo.collections.asr.models import SortformerEncLabelModel
 _DIAR_MODEL = None
 
 
+# #for streaming
+# diar_model.sortformer_modules.chunk_len = 6
+# diar_model.sortformer_modules.chunk_right_context = 7
+# diar_model.sortformer_modules.fifo_len = 188
+# diar_model.sortformer_modules.spkcache_update_period = 144
+#
+# #for streaming
+# diar_model.sortformer_modules.chunk_len = 3
+# diar_model.sortformer_modules.chunk_right_context = 1
+# diar_model.sortformer_modules.fifo_len = 188
+# diar_model.sortformer_modules.spkcache_update_period = 144
+
+
 def _get_diar_model():
     global _DIAR_MODEL
     if _DIAR_MODEL is None:
         _DIAR_MODEL = SortformerEncLabelModel.from_pretrained("nvidia/diar_streaming_sortformer_4spk-v2.1")
         _DIAR_MODEL.eval()
 
-        _DIAR_MODEL.sortformer_modules.chunk_len = 340
-        _DIAR_MODEL.sortformer_modules.chunk_right_context = 40
-        _DIAR_MODEL.sortformer_modules.fifo_len = 40
-        _DIAR_MODEL.sortformer_modules.spkcache_update_period = 300
+        _DIAR_MODEL.sortformer_modules.chunk_len = 6
+        _DIAR_MODEL.sortformer_modules.chunk_right_context = 7
+        _DIAR_MODEL.sortformer_modules.fifo_len = 188*5
+        _DIAR_MODEL.sortformer_modules.spkcache_update_period = 144
     return _DIAR_MODEL
 
 
-def nemo_dia(audio_npy):
+def nemo_dia(audio_npy, context=None):
+    """
+    Diarize audio with optional surrounding context.
+    
+    Args:
+        audio_npy: Current segment to diarize
+        context: Optional dict with 'previous' and 'next' context:
+            {
+                "previous": {"audio": np.ndarray, "speaker": str},
+                "next": {"audio": np.ndarray, "speaker": str},
+            }
+    
+    Returns:
+        List of diarization segments in format "start end speaker"
+    """
     model = _get_diar_model()
-    predicted_segments = model.diarize(audio=audio_npy, batch_size=1, sample_rate=16000)
-
-    # predicted_segments looks like this:
-    # ['0.400 3.040 speaker_0', ...]
-    return predicted_segments
+    
+    # If context is provided, concatenate surrounding audio for better context
+    if context:
+        audio_to_process = audio_npy
+        offset_ms = 0
+        
+        if context.get("previous") and context["previous"].get("audio") is not None:
+            prev_audio = context["previous"]["audio"]
+            audio_to_process = np.concatenate([prev_audio, audio_npy])
+            offset_ms = len(prev_audio) / 16000 * 1000  # offset in ms
+        
+        # Add next context if available
+        if context.get("next") and context["next"].get("audio") is not None:
+            next_audio = context["next"]["audio"]
+            audio_to_process = np.concatenate([audio_to_process, next_audio])
+        
+        predicted_segments = model.diarize(audio=audio_to_process, batch_size=1, sample_rate=16000)
+        
+        # Filter segments to only those within the current segment range
+        if predicted_segments and isinstance(predicted_segments[0], list):
+            predicted_segments = predicted_segments[0]
+        
+        # Adjust timestamps to current segment's coordinate system
+        current_duration_sec = len(audio_npy) / 16000
+        offset_sec = offset_ms / 1000
+        
+        filtered_segments = []
+        for line in predicted_segments:
+            parts = str(line).strip().split()
+            if len(parts) >= 3:
+                try:
+                    start, end = float(parts[0]), float(parts[1])
+                    # Only include segments that overlap with current audio
+                    if end > offset_sec and start < offset_sec + current_duration_sec:
+                        # Adjust timestamps to current segment's frame
+                        adjusted_start = max(0, start - offset_sec)
+                        adjusted_end = min(current_duration_sec, end - offset_sec)
+                        speaker = " ".join(parts[2:]).strip()
+                        filtered_segments.append(f"{adjusted_start} {adjusted_end} {speaker}")
+                except ValueError:
+                    pass
+        
+        return filtered_segments if filtered_segments else predicted_segments
+    else:
+        # No context: process current segment only
+        predicted_segments = model.diarize(audio=audio_npy, batch_size=1, sample_rate=16000)
+        
+        if predicted_segments and isinstance(predicted_segments[0], list):
+            predicted_segments = predicted_segments[0]
+        
+        return predicted_segments
