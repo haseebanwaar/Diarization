@@ -10,9 +10,15 @@ JSON events that already contain ASR and diarization fields.
 Send:
 - binary `int16` PCM audio frames, 16 kHz, mono
 - or a text frame containing JSON with `audio` / `data` as base64 PCM
+- after the final audio frame, send `{"type":"end_of_stream"}` and keep the
+  socket open until the server replies with `{"type":"complete"}`
 
 Recommended chunk size:
 - ~200 ms per frame
+
+The included Flutter file picker accepts headerless PCM or uncompressed WAV
+files that are 16 kHz, mono, and 16-bit. Compressed formats such as MP3/AAC must
+be decoded/resampled before streaming.
 
 Receive:
 - JSON text frames with `type: "partial"` while speech is still open

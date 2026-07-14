@@ -14,6 +14,12 @@ class VADWrapper:
             force_reload=False,
         )
 
+    def reset(self) -> None:
+        """Reset Silero's recurrent state before processing a new audio stream."""
+        reset_states = getattr(self.model, "reset_states", None)
+        if callable(reset_states):
+            reset_states()
+
     def is_speech(self, audio: np.ndarray) -> bool:
         """
         Check a single frame (512 samples @ 16 kHz) for speech.
