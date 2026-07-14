@@ -14,17 +14,20 @@ event dictionaries to the client.
 
 from __future__ import annotations
 
+import logging
 from typing import Iterator
 
 import numpy as np
 
 from buffer import AudioBuffer
 from nemo_dia import nemo_dia
-from parakeet import nemo_transcribe, nemo_transcribe_with_timestamps
+from parakeet import nemo_transcribe, nemo_transcribe_result
 from vad import VADWrapper
 
 SAMPLE_RATE = 16000
 VAD_FRAME_SAMPLES = 512
+
+logger = logging.getLogger(__name__)
 
 
 def _pcm_to_float32(raw_pcm: bytes | np.ndarray) -> np.ndarray:
@@ -50,8 +53,6 @@ class Pipeline:
     def __init__(
         self,
         vad: VADWrapper | None = None,
-        asr_fn=None,
-        dia_fn=None,
         vad_threshold: float = 0.5,
         silence_gap_sec: float = 0.6,
         max_words: int = 24,
@@ -63,9 +64,6 @@ class Pipeline:
         # min_partial_samples: int | None = None,
     ):
         self.vad = vad or VADWrapper(threshold=vad_threshold)
-        self.asr = asr_fn or nemo_transcribe
-        self.dia = dia_fn or nemo_dia
-
         self.vad_threshold = vad_threshold
         self.silence_gap_samples = int(silence_gap_sec * SAMPLE_RATE)
         self.max_words = max_words
@@ -89,7 +87,7 @@ class Pipeline:
         self._last_partial_text = ""
         self._last_partial_emit_sample = 0
         self._last_final_speaker = "unknown"
-        
+
         # Context buffer for diarization: stores previous segments for context
         self._context_history: list[dict] = []  # List of {audio, speaker, text}
         self._max_context_segments = 2  # Keep last 2 segments for context
@@ -212,7 +210,10 @@ class Pipeline:
         if not force and (self._stream_samples - self._last_partial_emit_sample) < self.partial_emit_samples:
             return
 
-        text = (self.asr(segment) or "").strip()
+        # Mark the attempt before running ASR. Otherwise empty or unchanged
+        # partials retry on every following audio chunk and can overwhelm NeMo.
+        self._last_partial_emit_sample = self._stream_samples
+        text = (nemo_transcribe(segment) or "").strip()
         if not text:
             return
 
@@ -227,17 +228,16 @@ class Pipeline:
             return
 
         self._last_partial_text = text
-        self._last_partial_emit_sample = self._stream_samples
-        
+
         # For partials, use current speaker or fall back to last known speaker
         speaker = self._last_final_speaker
-        
+
         # Optionally predict speaker based on context
         if self.use_diarization_context and self._context_history:
             # Predict speaker by keeping consistency with previous speaker
             prev_speaker = self._context_history[-1]["speaker"]
             speaker = prev_speaker
-        
+
         yield self._build_event(
             event_type="partial",
             text=text,
@@ -260,6 +260,8 @@ class Pipeline:
             return
 
         segment = self._current_audio()
+        trailing_silence_samples = self._silence_samples
+        partial_text_fallback = self._last_partial_text
         start_sample = self._segment_start_sample
         end_sample = max(self._last_voice_sample, start_sample + len(segment))
 
@@ -272,7 +274,10 @@ class Pipeline:
         if len(segment) < self.min_segment_samples:
             return
 
-        full_text = (self.asr(segment) or "").strip()
+        # Obtain final text and word timestamps in one model call. Previously the
+        # same segment was transcribed twice before any final event was emitted.
+        full_text, word_timestamps = nemo_transcribe_result(segment)
+        full_text = (full_text or partial_text_fallback or "").strip()
         if not full_text:
             return
 
@@ -288,27 +293,45 @@ class Pipeline:
                     "speaker": prev_seg["speaker"],
                 }
         
-        raw_segments = self.dia(segment, context=context) if context else self.dia(segment)
-        timeline = self._parse_diarization(raw_segments, segment)
+        # Diarization enriches the ASR result; it must not prevent a successful
+        # transcription from reaching the client if the diarization model fails.
+        try:
+            raw_segments = nemo_dia(segment, context=context) if context else nemo_dia(segment)
+            timeline = self._parse_diarization(raw_segments, segment)
+        except Exception:
+            logger.exception("Diarization failed for a finalized segment")
+            timeline = []
         primary_speaker = self._dominant_speaker(timeline)
         if primary_speaker == "unknown":
             primary_speaker = self._last_final_speaker
         else:
             self._last_final_speaker = primary_speaker
 
+        # Context continuity should follow the speaker nearest the end of this
+        # utterance, which is not necessarily its dominant speaker.
+        context_speaker = (
+            max(timeline, key=lambda item: item[1])[2]
+            if timeline
+            else primary_speaker
+        )
+
+        # Keep the context focused on voice evidence. A long VAD pause at the
+        # concatenation boundary can dominate Sortformer's turn decision and
+        # cause the same voice to receive a new local label after the pause.
+        context_audio = segment
+        if reason == "vad_silence" and 0 < trailing_silence_samples < len(segment):
+            context_audio = segment[:-trailing_silence_samples]
+
         # Store this segment in context history for next segment's diarization
         self._context_history.append({
-            "audio": segment.copy(),
-            "speaker": primary_speaker,
+            "audio": context_audio.copy(),
+            "speaker": context_speaker,
             "text": full_text,
         })
         # Keep only the last N segments
         if len(self._context_history) > self._max_context_segments:
             self._context_history.pop(0)
 
-        # Get word-level timestamps
-        word_timestamps = nemo_transcribe_with_timestamps(segment) or []
-        
         # Build word-level speaker assignments
         words_with_speakers = []
         for word_data in word_timestamps:
@@ -458,17 +481,17 @@ class Pipeline:
         """Find the speaker with the longest speaking duration."""
         if not timeline:
             return "unknown"
-        
+
         speaker_durations = {}
         for start, end, speaker in timeline:
             duration = end - start
             speaker = speaker.strip()
             if speaker:
                 speaker_durations[speaker] = speaker_durations.get(speaker, 0) + duration
-        
+
         if not speaker_durations:
             return "unknown"
-        
+
         return max(speaker_durations.items(), key=lambda x: x[1])[0]
 
     @staticmethod
@@ -476,7 +499,7 @@ class Pipeline:
         """Find the speaker(s) that cover this word timestamp."""
         if not timeline:
             return "unknown"
-        
+
         speakers = []
         for seg_start, seg_end, speaker in timeline:
             # Check if there's overlap between word and speaker segment
@@ -485,11 +508,11 @@ class Pipeline:
             if overlap_end > overlap_start:
                 overlap_duration = overlap_end - overlap_start
                 speakers.append((overlap_duration, speaker))
-        
+
         if speakers:
             # Return the speaker with the most overlap
             return max(speakers, key=lambda x: x[0])[1]
-        
+
         # Fallback: find the closest speaker segment by distance
         closest_speaker = None
         min_distance = float('inf')
@@ -501,9 +524,9 @@ class Pipeline:
                 distance = word_start - seg_end
             else:
                 distance = 0
-            
+
             if distance < min_distance:
                 min_distance = distance
                 closest_speaker = speaker
-        
+
         return closest_speaker if closest_speaker else "unknown"

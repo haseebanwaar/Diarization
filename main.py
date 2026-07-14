@@ -7,6 +7,7 @@ frontend can render partial and final text directly.
 
 from __future__ import annotations
 
+import asyncio
 import numpy as np
 import base64
 import json
@@ -39,11 +40,14 @@ DEFAULT_PIPELINE_CONFIG = {
     "silence_gap_sec": 0.6,
     "max_words": 24,
     "max_sentence_sec": 10.0,
-    "partial_emit_sec": 0.5,  # Increased: Too short of a duration can crash NeMo RNNT decoders
+    # Partial ASR retranscribes the complete growing utterance. A short interval
+    # creates heavy GPU backlog and can starve final transcription.
+    "partial_emit_sec": 2.0,
 }
 
 
 def build_pipeline() -> Pipeline:
+    shared_vad.reset()
     return Pipeline(vad=shared_vad, **DEFAULT_PIPELINE_CONFIG)
 
 
@@ -121,20 +125,44 @@ async def ws_stream(websocket: WebSocket):
                     payload = json.loads(text)
                 except json.JSONDecodeError:
                     payload = text
+
+                # Closing the WebSocket is not an end-of-audio signal: once it
+                # is closed there is nowhere to send the final transcription.
+                # The client sends this control message, waits for all finish()
+                # events and "complete", and only then lets the socket close.
+                if isinstance(payload, dict) and payload.get("type") == "end_of_stream":
+                    events = await asyncio.to_thread(lambda: list(local_pipe.finish()))
+                    for event in events:
+                        await websocket.send_text(json.dumps(event, ensure_ascii=False))
+                    await websocket.send_text(json.dumps({"type": "complete"}))
+                    await websocket.close(code=1000, reason="audio complete")
+                    return
+
                 raw = _decode_audio_payload(payload)
 
             if not raw:  # Ignore None and empty bytes (b"") to prevent zero-length audio processing
                 continue
 
-            for event in local_pipe.feed(raw):
+            # NeMo inference is synchronous and can be slow. Running it directly
+            # here blocks FastAPI's event loop, including WebSocket ping/pong.
+            events = await asyncio.to_thread(lambda: list(local_pipe.feed(raw)))
+            for event in events:
                 await websocket.send_text(json.dumps(event, ensure_ascii=False))
     except WebSocketDisconnect:
-        # Flush remaining buffer on disconnect.
-        for event in local_pipe.finish():
-            try:
-                await websocket.send_text(json.dumps(event, ensure_ascii=False))
-            except Exception:
-                pass
+        # A disconnected peer cannot receive finish() output. Clients must use
+        # the end_of_stream control message above for a lossless flush.
+        return
+    except Exception as exc:
+        # Surface model/decoding failures to the client instead of presenting an
+        # unexplained abnormal WebSocket closure.
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": str(exc),
+            }, ensure_ascii=False))
+            await websocket.close(code=1011, reason="server processing error")
+        except Exception:
+            pass
 
 
 # --- entrypoint -------------------------------------------------------
